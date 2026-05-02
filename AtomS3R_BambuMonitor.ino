@@ -10,8 +10,11 @@
             user: bblp / pass: <Access Code>  (Settings -> LAN Only)
             Topic: device/<SERIAL>/report
 
-  License : MIT
-  Repo    : https://github.com/<USER>/AtomS3R-BambuMonitor
+  Notes
+  - Enable "LAN Only Mode" or at least keep the printer reachable on LAN.
+  - Access Code resets on every printer reboot (Bambu spec).
+  - For X1 series: full status object every push.
+    For P1/A1 series: only changed fields are pushed; we cache last values.
 */
 
 #include <M5Unified.h>
@@ -19,7 +22,15 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include "config.h"   // <-- credentials are kept out of git
+
+// =================== USER CONFIG =====================================
+const char* WIFI_SSID     = "----------";
+const char* WIFI_PASSWORD = "----------";
+
+const char* PRINTER_IP    = "----------";        // Bambu printer LAN IP
+const char* PRINTER_SERIAL= "----------";    // SN (Bambu Studio -> Device)
+const char* ACCESS_CODE   = "----------";            // 8-digit LAN access code
+// =====================================================================
 
 // MQTT
 const uint16_t MQTT_PORT = 8883;
@@ -42,15 +53,22 @@ struct Status {
 bool needsRedraw = true;
 
 // ---------- Display layout (128 x 128) -------------------------------
+// 0..10   : header "Bambu"
+// 12..44  : nozzle / bed temp block
+// 46..78  : layer info (big)
+// 80..98  : progress bar
+// 100..127: footer (state)
+
 static void drawHeader() {
   M5.Display.fillRect(0, 0, 128, 11, TFT_BLACK);
+  // Green Bambu accent square + text logo (text only - no trademark image)
   M5.Display.fillRect(2, 2, 7, 7, 0x07E0);     // green dot
   M5.Display.setTextDatum(top_left);
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.setCursor(12, 2);
   M5.Display.print("Bambu Monitor");
-  M5.Display.drawFastHLine(0, 11, 128, 0x39C7);
+  M5.Display.drawFastHLine(0, 11, 128, 0x39C7); // separator
 }
 
 static void drawTemps() {
@@ -63,6 +81,7 @@ static void drawTemps() {
   M5.Display.setCursor(2, 30);
   M5.Display.print("Bed   ");
 
+  // Values (right aligned-ish), use a slightly larger font
   M5.Display.setFont(&fonts::Font2);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
 
@@ -83,6 +102,7 @@ static void drawLayer() {
   M5.Display.setCursor(2, 48);
   M5.Display.print("Layer");
 
+  // Big layer counter
   M5.Display.setFont(&fonts::Font4);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   char buf[24];
@@ -92,13 +112,15 @@ static void drawLayer() {
 }
 
 static void drawProgress() {
+  // Bar at y=82, height 14, padding 4
   const int x = 4, y = 82, w = 120, h = 14;
   M5.Display.drawRect(x, y, w, h, TFT_WHITE);
-  M5.Display.fillRect(x + 1, y + 1, w - 2, h - 2, 0x18C3);
+  M5.Display.fillRect(x + 1, y + 1, w - 2, h - 2, 0x18C3); // dark gray fill
   int fillW = (w - 2) * st.percent / 100;
   if (fillW > 0) {
-    M5.Display.fillRect(x + 1, y + 1, fillW, h - 2, 0x07E0);
+    M5.Display.fillRect(x + 1, y + 1, fillW, h - 2, 0x07E0); // green
   }
+  // Percent text overlaid
   char buf[8];
   snprintf(buf, sizeof(buf), "%d%%", st.percent);
   M5.Display.setFont(&fonts::Font0);
@@ -129,6 +151,8 @@ static void redrawAll() {
 
 // ---------- MQTT message parsing -------------------------------------
 static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
+  // Bambu reports can be 5-30 KB. Use PSRAM-backed JsonDocument.
+  // ArduinoJson v7: JsonDocument auto-allocates from heap (uses PSRAM if enabled).
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload, len);
   if (err) {
@@ -156,6 +180,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
   }
 }
 
+// Request a full pushall (useful for P1/A1 to fill cache after reconnect).
 static void requestPushAll() {
   StaticJsonDocument<128> req;
   JsonObject pushing = req["pushing"].to<JsonObject>();
@@ -168,11 +193,12 @@ static void requestPushAll() {
 
 static bool mqttConnect() {
   Serial.print("MQTT connect...");
+  // Bambu uses self-signed cert -> skip verification (standard practice).
   netClient.setInsecure();
   netClient.setTimeout(15);
 
   mqtt.setServer(PRINTER_IP, MQTT_PORT);
-  mqtt.setBufferSize(40 * 1024);
+  mqtt.setBufferSize(40 * 1024);   // Bambu full report can exceed 16 KB
   mqtt.setKeepAlive(30);
   mqtt.setCallback(onMqttMessage);
 
@@ -188,6 +214,7 @@ static bool mqttConnect() {
   return false;
 }
 
+// ---------- Setup / Loop ---------------------------------------------
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -198,9 +225,11 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
+  // Build topics
   snprintf(MQTT_TOPIC_REPORT,  sizeof(MQTT_TOPIC_REPORT),  "device/%s/report",  PRINTER_SERIAL);
   snprintf(MQTT_TOPIC_REQUEST, sizeof(MQTT_TOPIC_REQUEST), "device/%s/request", PRINTER_SERIAL);
 
+  // Splash
   drawHeader();
   drawFooter("WiFi connecting");
 
@@ -245,11 +274,13 @@ void loop() {
     redrawAll();
   }
 
+  // Stale detection: if no update for >60s, mark as offline
   if (st.lastUpdate && millis() - st.lastUpdate > 60000) {
     drawFooter("No data >60s");
     st.lastUpdate = 0;
   }
 
+  // Button: short press -> request pushall (refresh)
   if (M5.BtnA.wasClicked() && mqtt.connected()) {
     requestPushAll();
   }
